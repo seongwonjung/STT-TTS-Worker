@@ -19,6 +19,7 @@ from services.demucs_split import split_vocals
 from services.translate import translate_transcript
 from services.tts import (
     generate_tts,
+    _strip_background_from_sample,
     _transcribe_prompt_text,
     _synthesize_with_cosyvoice2,
 )
@@ -136,9 +137,17 @@ def _prepare_voice_replacements_local(paths, target_lang: str):
         diagnostics["reason"] = "no_matches"
         return overrides, diagnostics
     matches_summary: dict[str, dict] = {}
+    failures: dict[str, dict] = {}
     for speaker, plan in replacements.items():
         sample_path = _resolve_local_voice_sample(plan.entry.sample_key)
         if not sample_path or not sample_path.is_file():
+            failures[speaker] = {
+                "reason": "local_file_not_found",
+                "expected_path": str(sample_path) if sample_path else "None",
+                "voice_id": plan.entry.voice_id,
+                "sample_key": plan.entry.sample_key,
+                "message": f"Voice replacement sample for {plan.entry.voice_id} not found at {sample_path if sample_path else 'resolved path'}",
+            }
             continue
         overrides[speaker] = {
             "audio_path": str(sample_path),
@@ -151,11 +160,35 @@ def _prepare_voice_replacements_local(paths, target_lang: str):
         matches_summary[speaker] = plan.summary()
     if not overrides:
         diagnostics["reason"] = "materialization_failed"
+        # 실패한 화자들의 상세 정보 추가
+        if failures:
+            diagnostics["materialization_failures"] = failures
+            # 실패 원인별 통계
+            failure_reasons = {}
+            for speaker, failure_info in failures.items():
+                reason = failure_info.get("reason", "unknown")
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+            diagnostics["failure_summary"] = {
+                "total_failures": len(failures),
+                "failure_reasons": failure_reasons,
+            }
         return overrides, diagnostics
     diagnostics["enabled"] = True
     diagnostics["reason"] = "ok"
     diagnostics["matches"] = matches_summary
     diagnostics["prepared_speakers"] = sorted(overrides.keys())
+
+    # 일부는 성공하고 일부는 실패한 경우에도 실패 정보 기록
+    if failures:
+        diagnostics["materialization_failures"] = failures
+        diagnostics["failure_summary"] = {
+            "total_failures": len(failures),
+            "failure_reasons": {
+                reason: sum(1 for f in failures.values() if f.get("reason") == reason)
+                for reason in set(f.get("reason", "unknown") for f in failures.values())
+            },
+        }
+
     return overrides, diagnostics
 
 
@@ -505,6 +538,94 @@ async def voice_sample_test_endpoint(
         "prompt_text": prompt_text,
         "library_entry": library_entry,
     }
+
+
+@app.post("/tts/test")
+async def tts_test_endpoint(
+    text: str = Form(...),
+    voice_sample: UploadFile = File(...),
+    src_lang: str | None = Form(None),
+):
+    """Upload a short reference clip and synthesize TTS immediately."""
+    text_value = (text or "").strip()
+    if not text_value:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "text is required"},
+        )
+    if not voice_sample.filename:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "voice_sample file is required"},
+        )
+
+    job_id = str(uuid.uuid4())
+    paths = ensure_job_dirs(job_id)
+    work_dir = paths.interim_dir / "tts_test"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = Path(voice_sample.filename).suffix or ".wav"
+    raw_sample_path = work_dir / f"uploaded_sample{suffix}"
+    sample_bytes = await voice_sample.read()
+    with open(raw_sample_path, "wb") as f:
+        f.write(sample_bytes)
+
+    normalized_sample_path = work_dir / "tts_test_input.wav"
+    try:
+        audio = AudioSegment.from_file(str(raw_sample_path))
+        max_duration_ms = 30 * 1000
+        if len(audio) > max_duration_ms:
+            audio = audio[:max_duration_ms]
+        audio.set_frame_rate(16000).set_channels(1).export(
+            str(normalized_sample_path),
+            format="wav",
+        )
+    except Exception as exc:
+        logging.warning("Failed to normalize uploaded voice sample: %s", exc)
+        shutil.copy(raw_sample_path, normalized_sample_path)
+
+    cleaned_sample_path = _strip_background_from_sample(
+        normalized_sample_path, work_dir
+    )
+
+    final_sample_path = work_dir / "tts_test_voice.wav"
+    try:
+        cleaned_audio = AudioSegment.from_file(str(cleaned_sample_path))
+        cleaned_audio.set_frame_rate(16000).set_channels(1).export(
+            str(final_sample_path),
+            format="wav",
+        )
+    except Exception as exc:
+        logging.warning("Failed to convert cleaned sample: %s", exc)
+        shutil.copy(cleaned_sample_path, final_sample_path)
+
+    lang_hint = (src_lang or "").strip()
+    prompt_value = (
+        _transcribe_prompt_text(final_sample_path, language=lang_hint or None)
+        or text_value
+    )
+
+    output_path = paths.outputs_dir / "tts_test.wav"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _synthesize_with_cosyvoice2(
+            text_value, prompt_value, final_sample_path, output_path
+        )
+    except Exception as exc:
+        logging.exception("TTS test synthesis failed")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"TTS synthesis failed: {exc}"},
+        )
+
+    download_name = f"tts_test_{job_id}.wav"
+    return FileResponse(
+        output_path,
+        media_type="audio/wav",
+        filename=download_name,
+        headers={"X-Job-Id": job_id},
+    )
 
 
 @app.post("/sync")

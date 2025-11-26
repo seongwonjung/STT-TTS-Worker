@@ -50,6 +50,9 @@ RUN if [ "$CLONE_COSYVOICE" = "true" ]; then \
       python -m pip install --no-cache-dir -r requirements.txt; \
     fi
 
+# wetext를 명시적으로 설치 (ttsfrd 대신 사용)
+RUN python -m pip install --no-cache-dir wetext
+
 # ★ 핵심: torch 2.8의 triton(=3.4.0) 고정과 충돌 피하기 위해
 # openai-whisper를 --no-deps로 설치하고 필요한 최소 deps만 직접 핀으로 설치
 # (CosyVoice는 import만 필요. 실제 STT는 WhisperX/ faster-whisper 사용)

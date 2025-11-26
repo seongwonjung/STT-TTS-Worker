@@ -65,9 +65,7 @@ def _ensure_speaker_index(name: str, table: dict[str, int], ordered: list[str]) 
     return idx
 
 
-def _ensure_vocab_index(
-    token: str, table: dict[str, int], ordered: list[str]
-) -> int:
+def _ensure_vocab_index(token: str, table: dict[str, int], ordered: list[str]) -> int:
     if token in table:
         return table[token]
     idx = len(ordered)
@@ -82,6 +80,7 @@ class SegmentView:
     start_ms: int
     end_ms: int
     speaker: str
+    speaker_unknown: bool
     text: str
     gap_after_ms: int | None
     gap_after_vad_ms: int | None
@@ -121,6 +120,7 @@ class SegmentView:
             "idx": self.idx,
             "segment_id": self.segment_id(),
             "speaker": self.speaker,
+            "speaker_unknown": self.speaker_unknown,
             "start_ms": self.start_ms,
             "end_ms": self.end_ms,
             "start": _ms_to_seconds(self.start_ms),
@@ -181,9 +181,7 @@ def build_compact_transcript(
                 except (TypeError, ValueError):
                     pass
             score_q = _quantize_score(score_val)
-            compact_words.append(
-                [idx, offset_start, offset_end, vocab_idx, score_q]
-            )
+            compact_words.append([idx, offset_start, offset_end, vocab_idx, score_q])
         w_count = len(compact_words) - w_start
         segment_score_q: int | None = None
         if word_scores:
@@ -199,12 +197,8 @@ def build_compact_transcript(
             if idx + 1 < len(aligned_segments)
             else None
         )
-        gap_after = (
-            next_start_ms - end_ms if next_start_ms is not None else None
-        )
-        gap_after_vad = (
-            max(gap_after, 0) if gap_after is not None else None
-        )
+        gap_after = next_start_ms - end_ms if next_start_ms is not None else None
+        gap_after_vad = max(gap_after, 0) if gap_after is not None else None
         overlap = bool(prev_end_ms is not None and start_ms < prev_end_ms)
         prev_end_ms = end_ms if prev_end_ms is None else max(prev_end_ms, end_ms)
 
@@ -279,13 +273,17 @@ def segment_views(bundle: dict) -> List[SegmentView]:
         start_ms = int(seg.get("s") or 0)
         end_ms = int(seg.get("e") or start_ms)
         sp_idx = seg.get("sp")
-        speaker = (
-            speakers[sp_idx]
-            if isinstance(sp_idx, int) and 0 <= sp_idx < len(speakers)
-            else UNKNOWN_SPEAKER_NAME
-        )
-        if speaker == UNKNOWN_SPEAKER_NAME:
+        speaker_unknown = False
+        if isinstance(sp_idx, int) and 0 <= sp_idx < len(speakers):
+            resolved_speaker = speakers[sp_idx]
+        else:
+            resolved_speaker = UNKNOWN_SPEAKER_NAME
+            speaker_unknown = True
+        if resolved_speaker == UNKNOWN_SPEAKER_NAME:
+            speaker_unknown = True
             speaker = DEFAULT_SPEAKER_NAME
+        else:
+            speaker = resolved_speaker
         gap = seg.get("gap") or [None, None]
         w_off = seg.get("w_off") or [0, 0]
         score_q = seg.get("sc")
@@ -298,6 +296,7 @@ def segment_views(bundle: dict) -> List[SegmentView]:
                 start_ms=start_ms,
                 end_ms=end_ms,
                 speaker=speaker,
+                speaker_unknown=speaker_unknown,
                 text=seg.get("txt") or "",
                 gap_after_ms=gap[0],
                 gap_after_vad_ms=gap[1],

@@ -16,6 +16,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "app":
         raise
     from configs import get_job_paths
+from services.segment_quality import build_segment_issues, sync_percent_from_durations
 from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
@@ -83,11 +84,34 @@ def _sync_single_segment(
         raise RuntimeError("시간 조정 결과가 비정상입니다.")
 
     # 무음 패딩
-    # padding_ms = 0
+    padding_ms = 0
     # if hit_slow_cap and len(stretched) < target_ms:
     #     padding_ms = target_ms - len(stretched)
     #     stretched += AudioSegment.silent(duration=padding_ms)
     return stretched, ratio_to_apply, padding_ms, current_ms
+
+
+def sync_segment_to_range(
+    input_path: Path, target_duration_ms: int, output_path: Path
+) -> Path:
+    """
+    segment_tts의 fixed 모드에서 사용할 길이 보정:
+    - sync.py와 동일하게 pyrubberband로 tempo 조절
+    - 너무 많이 느려지는 건 MAX_SLOW_RATIO까지만 허용
+    """
+    if target_duration_ms <= 0:
+        raise ValueError("target_duration_ms must be positive")
+
+    # sync.py의 시간 보정 로직 재사용
+    synced_audio, ratio_applied, padding_ms, original_ms = _sync_single_segment(
+        input_path,
+        target_ms=target_duration_ms,
+        allow_ratio=MAX_SLOW_RATIO,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    synced_audio.export(str(output_path), format="wav")
+    return output_path
 
 
 def sync_segments(job_id: str) -> List[Dict]:
@@ -169,6 +193,16 @@ def sync_segments(job_id: str) -> List[Dict]:
         ]:
             if key in entry:
                 synced_entry[key] = entry[key]
+
+        sync_percent = sync_percent_from_durations(
+            source_duration_sec, synced_duration_sec
+        )
+        synced_entry["issues"] = build_segment_issues(
+            stt_score_q=getattr(source_seg, "score_q", None),
+            base=entry.get("issues"),
+            sync_percent=sync_percent,
+            speaker_unknown=getattr(source_seg, "speaker_unknown", None),
+        )
 
         synced_metadata.append(synced_entry)
 

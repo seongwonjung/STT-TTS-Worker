@@ -164,11 +164,13 @@ class GeminiTranslator:
         seg_idxs = [int(o["seg_idx"]) for o in items]
 
         sys = (
-            "You are a professional subtitle translator.\n"
+            "You are a dubbing subtitle translator.\n"
             "- Translate with dubbing in mind.\n"
             "- Idioms can be paraphrased.\n"
             "- translate short texts as briefly as possible.\n"
             "- For numbers, translate only with the pronunciation that fits the context.\n"
+            "- Proper nouns like AI should be translated phonetically.\n"
+            "- Characters other than the target language must not be entered.\n"
             "- Translate each item from source language to the target language.\n"
             "- Do NOT merge or split items.\n"
             "- Do NOT add explanations, numbering, or any extra text.\n"

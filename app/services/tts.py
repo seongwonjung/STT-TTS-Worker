@@ -16,6 +16,7 @@ import torch
 import torchaudio
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
+from services.segment_quality import build_segment_issues
 from services.self_reference import (
     SpeakerReferenceSample,
     deserialize_reference_mapping,
@@ -79,22 +80,22 @@ PROMPT_STT_COMPUTE = os.getenv("COSYVOICE_PROMPT_STT_COMPUTE")
 TRIM_MIN_CLIP_MS = 1000
 
 # ms 이상 지속되면 '실제 침묵 구간'으로 본다
-TRIM_MIN_SILENCE_MS = 120
+TRIM_MIN_SILENCE_MS = 100
 
 # 평균 볼륨보다 dB 이상 작으면 침묵 후보
-TRIM_SILENCE_DB_DROP = 18.0
+TRIM_SILENCE_DB_DROP = 20.0
 
 # 실제 잘라낼 때 여유로 남겨주는 여백
-TRIM_EDGE_GUARD_MS = 350
+TRIM_EDGE_GUARD_MS = 100
 
 # ms 이하이면 '짧은 잡소리 조각'으로 간주
 TRIM_EDGE_ARTIFACT_MS = 320
 
 # 시작/끝에서 ms 범위만 '잡소리 후보'로 본다
-TRIM_EDGE_WINDOW_MS = 900
+TRIM_EDGE_WINDOW_MS = 1200
 
 # VAD에서 ms 이내로 끊기면 한 덩어리로 묶음
-TRIM_VAD_BRIDGE_MS = 220
+TRIM_VAD_BRIDGE_MS = 240
 
 # VAD 프레임 길이 (30ms)
 TRIM_VAD_FRAME_MS = 30
@@ -204,19 +205,25 @@ def _strip_background_from_sample(sample_path: Path, work_dir: Path) -> Path:
     return sample_path
 
 
-def _transcribe_prompt_text(sample_path: Path) -> str:
+def _transcribe_prompt_text(sample_path: Path, language: str | None = None) -> str:
     """ASR the reference sample to obtain a light-weight prompt text."""
-    cache_key = str(sample_path.resolve())
+    lang_value = (language or "").strip()
+    lang_key = lang_value.lower()
+    cache_key = f"{sample_path.resolve()}::{lang_key or 'auto'}"
     if cache_key in _PROMPT_CACHE:
         return _PROMPT_CACHE[cache_key]
 
     text = ""
     try:
         model = _get_prompt_stt_model()
+        lang_arg = None
+        if lang_key and lang_key not in {"auto"}:
+            lang_arg = lang_value or None
         segments, _ = model.transcribe(
             str(sample_path),
             beam_size=1,
             best_of=1,
+            language=lang_arg,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 200},
         )
@@ -280,9 +287,43 @@ def _select_voice_sample(
             return path, override_ref
     ref = speaker_refs.get(speaker)
     if not ref:
-        raise FileNotFoundError(
-            f"No self-reference audio prepared for speaker {speaker}."
-        )
+        # 폴백: 사용 가능한 다른 화자의 샘플 사용
+        if speaker_refs:
+            # 화자 번호가 비슷한 것을 우선 선택, 없으면 첫 번째 사용
+            available_speakers = sorted(speaker_refs.keys())
+            fallback_speaker = None
+
+            # 같은 번호 패턴 찾기 (예: SPEAKER_04 -> SPEAKER_01, SPEAKER_02 중 선택)
+            try:
+                speaker_num = int(speaker.split("_")[-1]) if "_" in speaker else None
+                if speaker_num is not None:
+                    # 가장 가까운 번호의 화자 선택
+                    closest = min(
+                        available_speakers,
+                        key=lambda s: abs(
+                            int(s.split("_")[-1]) - speaker_num
+                            if "_" in s
+                            else float("inf")
+                        ),
+                    )
+                    fallback_speaker = closest
+            except (ValueError, IndexError):
+                pass
+
+            # 폴백 화자를 찾지 못했으면 첫 번째 사용 가능한 화자 사용
+            if not fallback_speaker:
+                fallback_speaker = available_speakers[0]
+
+            ref = speaker_refs[fallback_speaker]
+            logger.warning(
+                f"No self-reference audio for speaker {speaker}, "
+                f"using fallback speaker {fallback_speaker}"
+            )
+        else:
+            raise FileNotFoundError(
+                f"No self-reference audio prepared for speaker {speaker} "
+                f"and no fallback available."
+            )
     path = ref.audio_path
     if not path.is_file():
         raise FileNotFoundError(
@@ -681,20 +722,21 @@ def generate_tts(
         # --- 길이 기반 품질 체크 ---
         tts_status = "ok"
         quality_note = None
+        duration_ratio: float | None = None
         try:
             clip = AudioSegment.from_file(str(output_file))
             dur_ms = len(clip)
             target_ms = int(duration * 1000)
             if target_ms > 0:
-                ratio = dur_ms / target_ms
-            else:
-                ratio = 1.0
-
+                duration_ratio = dur_ms / target_ms
             # 타겟 대비 비정상적으로 짧거나 긴 경우
-            if target_ms > 0 and (ratio < 0.4 or ratio > 2.5):
+            if target_ms > 0 and (
+                duration_ratio is not None
+                and (duration_ratio < 0.4 or duration_ratio > 2.5)
+            ):
                 tts_status = "suspect_duration"
                 quality_note = (
-                    f"ratio={ratio:.2f}, dur={dur_ms}ms, target={target_ms}ms"
+                    f"ratio={duration_ratio:.2f}, dur={dur_ms}ms, target={target_ms}ms"
                 )
                 logger.warning(
                     "TTS duration looks off for seg_idx=%s (%s)",
@@ -721,13 +763,39 @@ def generate_tts(
             "tts_status": tts_status,
             "quality_note": quality_note,
         }
+        # 보이스 유사도/강제 대체 정보 계산
+        replacement_info = replacement_meta.get(speaker, {}) if replacement_meta else {}
+        voice_similarity: float | None = None
+        voice_low_sim_forced: bool | None = None
+
+        sim_raw = replacement_info.get("similarity")
+        if sim_raw is not None:
+            try:
+                voice_similarity = float(sim_raw)
+            except (TypeError, ValueError):
+                voice_similarity = None
+
+        # “라이브러리에서 골라온 대체 보이스”인 경우에만 강제 여부 판단
+        if speaker in override_refs and voice_similarity is not None:
+            LOW_SIM_THRESHOLD = 0.45  # 코사인 0.45 이하면 낮은 편으로 봄 (조절 가능)
+            if voice_similarity < LOW_SIM_THRESHOLD:
+                voice_low_sim_forced = True
+
+        # 기존 issues 호출을 voice 인자까지 넘기도록 확장
+        entry["issues"] = build_segment_issues(
+            stt_score_q=seg.score_q,
+            tts_ratio=duration_ratio,
+            speaker_unknown=seg.speaker_unknown,
+            voice_similarity=voice_similarity,
+            voice_low_similarity_forced=voice_low_sim_forced,
+        )
         if speaker in override_refs:
-            replacement_info = replacement_meta.get(speaker, {})
             entry["voice_replacement"] = {
                 "voice_id": replacement_info.get("voice_id"),
-                "similarity": replacement_info.get("similarity"),
+                "similarity": voice_similarity,
                 "sample_key": replacement_info.get("sample_key"),
                 "sample_bucket": replacement_info.get("sample_bucket"),
+                "language": replacement_info.get("language"),
             }
         return entry
 

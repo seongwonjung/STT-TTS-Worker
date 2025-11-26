@@ -25,6 +25,7 @@ services:
       - MODELS_DIR=/models
       - WHISPERX_CACHE_DIR=/models/.cache/whisperx
       - XDG_CACHE_HOME=/models/.cache
+      - MODELSCOPE_CACHE=/models/.cache/modelscope
       - AWS_PROFILE=dev
       - CUDA_HOME=${CUDA_HOME-/usr/local/cuda}
       # 컨테이너 내부 기본값으로 PYTHONPATH 지정 (호스트에 같은 이름 env가 있으면 그 값을 사용)

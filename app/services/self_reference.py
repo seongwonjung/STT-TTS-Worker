@@ -14,7 +14,7 @@ from .transcript_store import SegmentView
 logger = logging.getLogger(__name__)
 
 # self-reference 프롬프트 오디오 길이 제한 및 가중치 정의
-MIN_REF_DURATION_MS = 2_000
+MIN_REF_DURATION_MS = 1_000
 IDEAL_REF_DURATION_MS = 5_000
 MAX_REF_DURATION_MS = 15_000
 
@@ -22,7 +22,7 @@ CLARITY_WEIGHT = 0.7
 SILENCE_WEIGHT = 0.3
 QUALITY_WEIGHT = 0.65
 LENGTH_WEIGHT = 0.35
-MIN_CONTENT_SCORE = 0.2
+MIN_CONTENT_SCORE = 0.1
 
 
 @dataclass
